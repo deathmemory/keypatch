@@ -10,9 +10,8 @@ Keypatch consists of 3 tools inside.
 
 See [this quick tutorial](TUTORIAL.md) for how to use Keypatch, and [this slides](Keypatch-slides.pdf) for how it is implemented.
 
-Keypatch is confirmed to work on IDA Pro version 6.4, 6.5, 6.6, 6.8, 6.9, 6.95 but should work flawlessly on older versions.
+Keypatch is confirmed to work on IDA Pro version 6.4, 6.5, 6.6, 6.8, 6.9, 6.95, 7.0, 7.5 but should work flawlessly on older versions.
 If you find any issues, please [report](http://keystone-engine.org/contact).
-
 
 --------------------
 
@@ -33,7 +32,6 @@ Keypatch was developed to solve this problem. Thanks to the power of [Keystone](
 - Open source under GPL v2.
 
 Keypatch can be the missing piece in your toolset of reverse engineering.
-
 
 --------------
 
@@ -103,75 +101,14 @@ Email keystone.engine@gmail.com for any questions.
 
 For future update of Keypatch, follow our Twitter [@keystone_engine](https://twitter.com/keystone_engine) for announcement.
 
-
 ----
 
 ### Appendix. Install Keystone for IDA Pro
 
-IDA Pro's Python is 32-bit itself, so it can only loads 32-bit libraries. For this reason, we have to build & install Keystone 32-bit. This section details the steps towards that goal.
+We all know that before IDA 7.0, IDA Pro's Python is 32-bit itself, so it can only loads 32-bit libraries. For this reason, we have to build & install Keystone 32-bit. However, since IDA 7.0 supports both 32-bit & 64-bit, which means we also need to install a correct version of Keystone. Simply install from Pypi, with `pip` (32-bit), like followings:
 
-#### A1. Windows
-
-It is easiest to just download & install Python 2.7 module for Windows from [http://www.keystone-engine.org/download](http://www.keystone-engine.org/download). Be sure to get the 32-bit version, regardless of your Windows edition.
-
-If you prefer to compile from source, just use MSVC 32-bit & follow the instructions in [Windows documentation](https://github.com/keystone-engine/keystone/blob/master/docs/COMPILE-WINDOWS.md) to build `keystone.dll`. After that, install Python module as in [Python documentation](https://github.com/keystone-engine/keystone/blob/master/bindings/python/README.md). Then copy `keystone.dll` to the directory of Keystone Python module.
-
-#### A2. MacOS
-
-Install the core & Python module of Keystone with the following command:
-
+```shell
+pip install keystone-engine
 ```
-$ sudo pip install keystone-engine
-```
-
-In case IDA still complains "ImportError: No module named keystone" when Keypatch is loading, then do the following step to copy Keystone Python binding to IDA directory. (replace `6.8` with your actual IDA version)
-
-```
-$ sudo cp -r /Library/Python/2.7/site-packages/keystone /Applications/IDA\ Pro\ 6.8/idaq.app/Contents/MacOS/python
-```
-
-#### A3. Linux
-
-First of all, be sure that your machine already have Cmake installed. On Ubuntu, you can install Cmake with:
-
-```
-$ sudo apt-get install cmake
-```
-
-Then if your system is Linux 32-bit, you can install Keystone via `pip` as with MacOS above.
-
-```
-$ sudo pip install keystone-engine
-```
-
-In case you are on 64-bit Linux, you need to cross compile Keystone to 32-bit. Since version 0.9.1, Keystone supports `lib32` option to make this easy. After building the core, install Python module as in [Python documentation](https://github.com/keystone-engine/keystone/blob/master/bindings/python/README.md).
-
-Note that to cross-compile on Linux, you need to install some multilib libraries. For example, on Ubuntu 14.04 64-bit, do this with:
-
-    $ sudo apt-get install lib32stdc++-4.8-dev libc6-dev-i386
-
-After having multilib dependencies, run the following commands in the source directory of Keystone.
-
-```
-$ mkdir build
-$ cd build
-$ ../make-share.sh lib32 lib_only
-```
-
-Then copy Python bindings to IDA's Python directory, together with disutils from your distro's Python to IDA's Python, like following. (Use your actual IDA directory instead)
-
-```
-$ sudo cp -r bindings/python/keystone /opt/IDAPro6.8/python/
-$ sudo cp -r /usr/lib/python2.7/distutils /opt/IDAPro6.8/python/
-```
-
-Finally, copy the 32-bit libraries of Keystone to the Python directory of IDA Pro, like following.
-
-```
-$ sudo cp build/llvm/lib/libkeystone.so.* /opt/IDAPro6.8/python/keystone/
-```
-
-These complicated workarounds are necessary because IDA in Linux 64 bit doesn't use the system's Python.
 
 Done? Now go back to [section 2](#2-install) & install Keypatch for IDA Pro. Enjoy!
-

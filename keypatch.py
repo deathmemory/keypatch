@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 
 # Keypatch IDA Plugin, powered by Keystone Engine (http://www.keystone-engine.org).
-# By Nguyen Anh Quynh & Thanh Nguyen, 2016.
+# By Nguyen Anh Quynh & Thanh Nguyen, 2018.
 
 # Keypatch is released under the GPL v2. See COPYING for more information.
 # Find docs & latest version at http://keystone-engine.org/keypatch
@@ -16,19 +16,101 @@
 # To revert (undo) the last patching, choose menu "Edit | Keypatch | Undo last patching".
 # To check for update version, choose menu "Edit | Keypatch | Check for update".
 
-import idc
-import idaapi
+'''
+    Do not use shortcut(Ctrk + Alt + K) for debugging, otherwise debugging features will not be available.
+'''
+#########################################################################################################
+is_debug = False
+if is_debug:
+    ''' 
+        Install pydevd:
+
+        1. sudo pip install pydevd
+
+        or
+
+        2. Install pycharm-debug.egg, Ensure to use pycharm pro
+        https://www.jetbrains.com/help/pycharm/remote-debugging-with-product.html
+
+        # import site
+        # site.addsitedir("/usr/local/lib/python2.7/site-packages")
+    '''
+    try:
+        import pydevd
+
+        pydevd.settrace(host='localhost',
+                        port=51234,
+                        stdoutToServer=True,
+                        stderrToServer=True
+                        )
+    except Exception as e:
+        print(e)
+#########################################################################################################
+
+import os
 import re
 import json
 from keystone import *
+import idc
+import idaapi
+import six
 
+################################ IDA 6/7 Compatibility import ###########################################
+if idaapi.IDA_SDK_VERSION >= 700:
+    import ida_search
+    from idc import (
+        get_operand_type,
+        print_operand,
+        get_item_end,
+        get_item_head,
+        get_item_size,
+        get_sreg,
+        has_value,
+        get_full_flags,
+        get_wide_byte,
+        get_func_attr,
+        set_func_end,
+        warning,
+        get_screen_ea
+    )
+    from idaapi import (
+        get_bytes,
+        plan_and_wait,
+        is_mapped,
+        Choose,
+        jumpto
+    )
+else:
+    from idc import (
+        GetOpType as get_operand_type,
+        GetOpnd as print_operand,
+        ItemEnd as get_item_end,
+        ItemHead as get_item_head,
+        ItemSize as get_item_size,
+        GetReg as get_sreg,
+        hasValue as has_value,
+        GetFlags as get_full_flags,
+        Byte as get_wide_byte,
+        GetFunctionAttr as get_func_attr,
+        Jump as jumpto,
+        Warning as warning,
+        ScreenEA as get_screen_ea
+    )
+    from idaapi import (
+        get_many_bytes as get_bytes,
+        analyze_area as plan_and_wait,
+        isEnabled as is_mapped,
+        func_setend as set_func_end,
+        Choose2 as Choose
+    )
+#########################################################################################################
 
 # bleeding-edge version
 # on a new release, this should be sync with VERSION_STABLE file
-VERSION = "2.1"
+VERSION = "2.2"
 
 
-MAX_INSTRUCTION_STRLEN = 64
+MAX_INSTRUCTION_STRLEN = 256
 MAX_ENCODING_LEN = 40
 MAX_ADDRESS_LEN = 40
 ENCODING_ERR_OUTPUT = "..."
@@ -43,9 +125,52 @@ KP_CFGFILE = os.path.join(idaapi.get_user_idadir(), "keypatch.cfg")
 # save all the info on patching
 patch_info = []
 
+################################ Python2/3 Compatibility function #######################################
+# Convert unicode/string/bytes to string
+def to_string(s):
+  # python3 bytes
+  if six.PY3 and isinstance(s, bytes):
+      return s.decode('latin-1')
+  # python2 unicode
+  elif six.PY2 and isinstance(s, six.text_type):
+      return s.encode('utf-8')
+  return str(s)
 
 def to_hexstr(buf, sep=' '):
+    # for python3 bytes
+    if six.PY3 and isinstance(buf, bytes):
+        return sep.join("{0:02x}".format(c) for c in buf).upper()
     return sep.join("{0:02x}".format(ord(c)) for c in buf).upper()
+#########################################################################################################
+
+################################ IDA 6/7 Compatibility function #########################################
+def get_dtype(ea, op_idx):
+    if idaapi.IDA_SDK_VERSION >= 700:
+        insn = idaapi.insn_t()
+        idaapi.decode_insn(insn, ea)
+        dtype = insn.ops[op_idx].dtype
+        dtyp_size = idaapi.get_dtype_size(dtype)
+    else:
+        dtype = idaapi.cmd.Operands[op_idx].dtyp
+        dtyp_size = idaapi.get_dtyp_size(dtype)
+    return dtype, dtyp_size
+
+def set_comment(ea, comment):
+    if idaapi.IDA_SDK_VERSION >= 700:
+        idc.set_cmt(ea, comment, 0)
+    else:
+        idc.MakeComm(ea, comment)
+
+def get_comment(ea):
+    if idaapi.IDA_SDK_VERSION >= 700:
+        return idc.get_cmt(ea, 0)
+    return idc.Comment(ea)
+
+def read_range_selection():
+    if idaapi.IDA_SDK_VERSION >= 700:
+        return idaapi.read_range_selection(None)
+    return idaapi.read_selection()
+#########################################################################################################
 
 # return a normalized code, or None if input is invalid
 def convert_hexstr(code):
@@ -78,10 +203,16 @@ def convert_hexstr(code):
         # invalid hex
         return None
 
+
 # download a file from @url, then return (result, file-content)
 # return (0, content) on success, or ({1|2}, None) on download failure
 def url_download(url):
-    from urllib2 import Request, urlopen, URLError, HTTPError
+    # Import for python2
+    try:
+        from urllib2 import Request, urlopen, URLError, HTTPError
+    except:
+        from urllib.request import Request, urlopen
+        from urllib.error import URLError, HTTPError
 
     # create the url and the request
     req = Request(url)
@@ -94,11 +225,11 @@ def url_download(url):
         return (0, content)
 
     # handle errors
-    except HTTPError, e:
+    except HTTPError as e:
         # print "HTTP Error:", e.code , url
         # fail to download this file
         return (1, None)
-    except URLError, e:
+    except URLError as e:
         # print "URL Error:", e.reason , url
         # fail to download this file
         return (1, None)
@@ -106,6 +237,28 @@ def url_download(url):
         # fail to save the downloaded file
         # print("Error:", e)
         return (2, None)
+
+
+def get_name_value(_from, name):
+    """
+    Fixed: the return value truncated(32 bit) of get_name_value function that analyzed 64 bit binary file about ida64 for win.
+
+    eg:
+    type == idaapi.NT_BYTE
+    (type, value) = idaapi.get_name_value(idc.BADADDR, "wcschr") # ida64 for win
+
+    value = 0x14003d3f0L is correct  ida64 > 7.x for macOS
+    value = 0x4003d3f0L is truncated ida64 >= 6.x for win, ida64 == 6.x for macOS
+
+    :param _from: ea
+    :param name: name string
+    :return: tuple
+    """
+    name = to_string(name)
+    (typ, value) = idaapi.get_name_value(_from, name)
+    if typ == idaapi.NT_BYTE:  # typ is byte name (regular name)
+        value = idaapi.get_name_ea(_from, name)
+    return (typ, value)
 
 
 ## Main Keypatch class
@@ -159,7 +312,20 @@ class Keypatch_Asm:
 
         # heuristically detect hardware setup
         info = idaapi.get_inf_structure()
-        cpuname = info.procName.lower()
+        
+        try:
+            cpuname = info.procname.lower()
+        except:
+            cpuname = info.procName.lower()
+
+        try:
+            # since IDA7 beta 3 (170724) renamed inf.mf -> is_be()/set_be()
+            is_be = idaapi.cvar.inf.is_be()
+        except:
+            # older IDA versions
+            is_be = idaapi.cvar.inf.mf
+        # print("Keypatch BIG_ENDIAN = %s" %is_be)
+        
         if cpuname == "metapc":
             arch = KS_ARCH_X86
             if info.is_64bit():
@@ -172,24 +338,27 @@ class Keypatch_Asm:
             # ARM or ARM64
             if info.is_64bit():
                 arch = KS_ARCH_ARM64
-                mode = KS_MODE_LITTLE_ENDIAN
+                if is_be:
+                    mode = KS_MODE_BIG_ENDIAN
+                else:
+                    mode = KS_MODE_LITTLE_ENDIAN
             else:
                 arch = KS_ARCH_ARM
                 # either big-endian or little-endian
-                if cpuname == "arm":
-                    mode = KS_MODE_ARM | KS_MODE_LITTLE_ENDIAN
-                else:
+                if is_be:
                     mode = KS_MODE_ARM | KS_MODE_BIG_ENDIAN
+                else:
+                    mode = KS_MODE_ARM | KS_MODE_LITTLE_ENDIAN
         elif cpuname.startswith("sparc"):
             arch = KS_ARCH_SPARC
             if info.is_64bit():
                 mode = KS_MODE_SPARC64
             else:
                 mode = KS_MODE_SPARC32
-            if cpuname == "sparcb":
-                mode += KS_MODE_BIG_ENDIAN
+            if is_be:
+                mode |= KS_MODE_BIG_ENDIAN
             else:
-                mode += KS_MODE_LITTLE_ENDIAN
+                mode |= KS_MODE_LITTLE_ENDIAN
         elif cpuname.startswith("ppc"):
             arch = KS_ARCH_PPC
             if info.is_64bit():
@@ -205,10 +374,10 @@ class Keypatch_Asm:
                 mode = KS_MODE_MIPS64
             else:
                 mode = KS_MODE_MIPS32
-            if cpuname == "mipsl":
-                mode += KS_MODE_LITTLE_ENDIAN
+            if is_be:
+                mode |= KS_MODE_BIG_ENDIAN
             else:
-                mode += KS_MODE_BIG_ENDIAN
+                mode |= KS_MODE_LITTLE_ENDIAN
         elif cpuname.startswith("systemz") or cpuname.startswith("s390x"):
             arch = KS_ARCH_SYSTEMZ
             mode = KS_MODE_BIG_ENDIAN
@@ -236,7 +405,7 @@ class Keypatch_Asm:
     #        1  valid address at target binary
     def check_address(address):
         try:
-            if idaapi.isEnabled(address):
+            if is_mapped(address):
                 return 1
             else:
                 return -1
@@ -248,7 +417,7 @@ class Keypatch_Asm:
     # todo: a better syntax parser for all archs
     def ida_resolve(self, assembly, address=idc.BADADDR):
         def _resolve(_op, ignore_kw=True):
-            names = re.findall(r"\b[a-z0-9_:\.]+\b", _op, re.I)
+            names = re.findall(r"[\$a-z0-9_:\.]+", _op, re.I)
 
             # try to resolve all names
             for name in names:
@@ -263,13 +432,13 @@ class Keypatch_Asm:
                 if parts[2] != '':
                     sym = parts[2]
 
-                (t, v) = idaapi.get_name_value(address, sym)
+                (typ, value) = get_name_value(address, sym)
 
                 # skip if name doesn't exist or segment / segment registers
-                if t in (idaapi.NT_SEG, idaapi.NT_NONE):
+                if typ in (idaapi.NT_SEG, idaapi.NT_NONE):
                     continue
 
-                _op = _op.replace(sym, '0x{0:X}'.format(v))
+                _op = _op.replace(sym, '0x{0:X}'.format(value))
 
             return _op
 
@@ -310,11 +479,11 @@ class Keypatch_Asm:
             return (None, 0)
 
         # return None if address is in the middle of instruction / data
-        if address != idc.ItemHead(address):
+        if address != get_item_head(address):
             return (None, 0)
 
-        len = idc.ItemSize(address)
-        item = idaapi.get_many_bytes(address, len)
+        size = get_item_size(address)
+        item = get_bytes(address, size)
 
         if item is None:
             return (None, 0)
@@ -322,10 +491,10 @@ class Keypatch_Asm:
         if hex_output:
             item = to_hexstr(item)
 
-        return (item, len)
+        return (item, size)
 
     @staticmethod
-    def get_op_dtype_name(op_idx):
+    def get_op_dtype_name(ea, op_idx):
         dtyp_lists = {
             idaapi.dt_byte: 'byte',     #  8 bit
             idaapi.dt_word: 'word',     #  16 bit
@@ -347,13 +516,11 @@ class Keypatch_Asm:
             idaapi.dt_byte32: 'ymmword',# 256 bit
         }
 
-        dtype = idaapi.cmd.Operands[op_idx].dtyp
-        dtyp_size = idaapi.get_dtyp_size(dtype)
-        if dtype == idaapi.dt_tbyte:
-            if dtyp_size == 10:
-                return 'xword'
+        dtype, dtyp_size = get_dtype(ea, op_idx)
+        if dtype == idaapi.dt_tbyte and dtyp_size == 10:
+          return 'xword'
 
-        dtyp_name = dtyp_lists.get(idaapi.cmd.Operands[op_idx].dtyp, None)
+        dtyp_name = dtyp_lists.get(dtype, None)
 
         return dtyp_name
 
@@ -365,7 +532,7 @@ class Keypatch_Asm:
             if asm == None:
                 asm = ''
             codes.append(asm)
-            start = start + idc.ItemSize(start)
+            start = start + get_item_size(start)
 
         return codes
 
@@ -375,7 +542,7 @@ class Keypatch_Asm:
 
         def GetMnem(asm):
             sp = asm.find(' ')
-            if (sp == -1):
+            if sp == -1:
                 return asm
             return asm[:sp]
 
@@ -384,7 +551,7 @@ class Keypatch_Asm:
             return ''
 
         # return if address is in the middle of instruction / data
-        if address != idc.ItemHead(address):
+        if address != get_item_head(address):
             return ''
 
         asm = self.asm_normalize(idc.GetDisasm(address))
@@ -400,11 +567,11 @@ class Keypatch_Asm:
             return asm
 
         opers = []
-        while GetOpType(address, i) > 0 and i < 6:
-            t = GetOpType(address, i)
-            o = GetOpnd(address, i)
+        while get_operand_type(address, i) > 0 and i < 6:
+            t = get_operand_type(address, i)
+            o = print_operand(address, i)
 
-            if t in (idc.o_mem, o_displ):
+            if t in (idc.o_mem, idc.o_displ):
                 parts = list(o.partition(':'))
                 if parts[2] == '':
                     parts[2] = parts[0]
@@ -416,7 +583,7 @@ class Keypatch_Asm:
                 o = ''.join(parts)
 
                 if 'ptr ' not in o:
-                    dtyp_name = self.get_op_dtype_name(i)
+                    dtyp_name = self.get_op_dtype_name(address, i)
                     if dtyp_name != None:
                         o = "{0} ptr {1}".format(dtyp_name, o)
 
@@ -550,6 +717,9 @@ class Keypatch_Asm:
 
                 # *** PPC
                 # stw     r5, 0x120+var_108(r1)
+                
+                if self.arch == KS_ARCH_ARM and mode == KS_MODE_THUMB:
+                    assembly = assembly.replace('movt.w', 'movt')
 
                 if self.arch == KS_ARCH_ARM:
                     #print(">> before UAL fix: ", assembly)
@@ -571,7 +741,7 @@ class Keypatch_Asm:
             return assembly
 
         def is_thumb(address):
-            return idc.GetReg(address, 'T') == 1
+            return get_sreg(address, 'T') == 1
 
         if self.check_address(address) == 0:
             return (None, 0)
@@ -605,17 +775,17 @@ class Keypatch_Asm:
     # patch at address, return the number of written bytes & original data
     # this process can fail in some cases
     @staticmethod
-    def patch_raw(address, patch_data, len):
+    def patch_raw(address, patch_data, size):
         ea = address
         orig_data = ''
 
-        while ea < (address + len):
+        while ea < (address + size):
 
-            if not idc.hasValue(idc.GetFlags(ea)):
+            if not has_value(get_full_flags(ea)):
                 print("Keypatch: FAILED to read data at 0x{0:X}".format(ea))
                 break
 
-            orig_byte = idc.Byte(ea)
+            orig_byte = get_wide_byte(ea)
             orig_data += chr(orig_byte)
             patch_byte = ord(patch_data[ea - address])
 
@@ -629,13 +799,13 @@ class Keypatch_Asm:
 
     # patch at address, return the number of written bytes & original data
     # on patch failure, we revert to the original code, then return (None, None)
-    def patch(self, address, patch_data, len):
+    def patch(self, address, patch_data, size):
         # save original function end to fix IDA re-analyze issue after patching
-        orig_func_end = idc.GetFunctionAttr(address, idc.FUNCATTR_END)
+        orig_func_end = get_func_attr(address, idc.FUNCATTR_END)
 
-        (patched_len, orig_data) = self.patch_raw(address, patch_data, len)
+        (patched_len, orig_data) = self.patch_raw(address, patch_data, size)
 
-        if len != patched_len:
+        if size != patched_len:
             # patch failure
             if patched_len > 0:
                 # revert the changes
@@ -652,12 +822,12 @@ class Keypatch_Asm:
         # ask IDA to re-analyze the patched area
         if orig_func_end == idc.BADADDR:
             # only analyze patched bytes, otherwise it would take a lot of time to re-analyze the whole binary
-            idaapi.analyze_area(address, address + patched_len + 1)
+            plan_and_wait(address, address + patched_len + 1)
         else:
-            idaapi.analyze_area(address, orig_func_end)
+            plan_and_wait(address, orig_func_end)
 
             # try to fix IDA function re-analyze issue after patching
-            idaapi.func_setend(address, orig_func_end)
+            set_func_end(address, orig_func_end)
 
         return (patched_len, orig_data)
 
@@ -674,8 +844,8 @@ class Keypatch_Asm:
             # not a valid address
             return -3
 
-        orig_comment = idc.Comment(address)
-        if orig_comment == None:
+        orig_comment = get_comment(address)
+        if orig_comment is None:
             orig_comment = ''
 
         nop_comment = ""
@@ -705,7 +875,7 @@ class Keypatch_Asm:
                     patch_data = patch_data.ljust(patch_len, X86_NOP)
                 elif patch_len > orig_len:
                     patch_end = address + patch_len - 1
-                    ins_end = ItemEnd(patch_end)
+                    ins_end = get_item_end(patch_end)
                     padding_len = ins_end - patch_end - 1
 
                     if padding_len > 0:
@@ -721,13 +891,13 @@ class Keypatch_Asm:
             patch_len = len(patch_data)
 
         (plen, p_orig_data) = self.patch(address, patch_data, patch_len)
-        if plen == None:
+        if plen is None:
             # failed to patch
             return -1
 
         if not undo: # we are patching
             new_patch_comment = None
-            if save_origcode == True:
+            if save_origcode is True:
                 # append original instruction to comments
                 if orig_comment == '':
                     new_patch_comment = "Keypatch modified this from:\n  {0}{1}".format('\n  '.join(orig_asm), nop_comment)
@@ -735,7 +905,7 @@ class Keypatch_Asm:
                     new_patch_comment = "\nKeypatch modified this from:\n  {0}{1}".format('\n  '.join(orig_asm), nop_comment)
 
                 new_comment = "{0}{1}".format(orig_comment, new_patch_comment)
-                idc.MakeComm(address, new_comment)
+                set_comment(address, new_comment)
 
             if padding_len == 0:
                 print("Keypatch: successfully patched {0:d} byte(s) at 0x{1:X} from [{2}] to [{3}]".format(plen,
@@ -749,7 +919,7 @@ class Keypatch_Asm:
             if patch_comment:
                 # clean previous IDA comment by replacing it with ''
                 new_comment = orig_comment.replace(patch_comment, '')
-                idc.MakeComm(address, new_comment)
+                set_comment(address, new_comment)
 
             print("Keypatch: successfully reverted {0:d} byte(s) at 0x{1:X} from [{2}] to [{3}]".format(plen,
                                         address, to_hexstr(p_orig_data), to_hexstr(patch_data)))
@@ -767,7 +937,7 @@ class Keypatch_Asm:
             # input might be a hexcode string. try to convert it to raw bytes
             encoding = convert_hexstr(assembly)
 
-        if encoding == None:
+        if encoding is None:
             # invalid input: this is neither assembly nor hexcode string
             return 0
 
@@ -776,8 +946,8 @@ class Keypatch_Asm:
 
         # save original comment at addr_begin
         # TODO: save comments in this range, but how to interleave them?
-        orig_comment = idc.Comment(addr_begin)
-        if orig_comment == None:
+        orig_comment = get_comment(addr_begin)
+        if orig_comment is None:
             orig_comment = ''
 
         patch_data = ""
@@ -799,20 +969,20 @@ class Keypatch_Asm:
             patch_data = patch_data.ljust(size, X86_NOP)
 
         (plen, p_orig_data) = self.patch(addr_begin, patch_data, len(patch_data))
-        if plen == None:
+        if plen is None:
             # failed to patch
             return -1
 
         new_patch_comment = ''
         # append original instruction to comments
-        if save_origcode == True:
+        if save_origcode is True:
             if orig_comment == '':
                 new_patch_comment = "Keypatch filled range [0x{0:X}:0x{1:X}] ({2} bytes), replaced:\n  {3}".format(addr_begin, addr_end - 1, addr_end - addr_begin, '\n  '.join(orig_asm))
             else:
                 new_patch_comment = "\nKeypatch filled range [0x{0:X}:0x{1:X}] ({2} bytes), replaced:\n  {3}".format(addr_begin, addr_end - 1, addr_end - addr_begin, '\n  '.join(orig_asm))
 
             new_comment = "{0}{1}".format(orig_comment, new_patch_comment)
-            idc.MakeComm(addr_begin, new_comment)
+            set_comment(addr_begin, new_comment)
 
         print("Keypatch: successfully filled range [0x{0:X}:0x{1:X}] ({2} bytes) with \"{3}\", replaced \"{4}\"".format(
                     addr_begin, addr_end - 1, addr_end - addr_begin, assembly, '; '.join(orig_asm)))
@@ -826,9 +996,9 @@ class Keypatch_Asm:
     ### Form helper functions
     @staticmethod
     def dict_to_ordered_list(dictionary):
-        list = sorted(dictionary.items(), key=lambda t: t[0], reverse=False)
-        keys = [i[0] for i in list]
-        values = [i[1] for i in list]
+        l = sorted(list(dictionary.items()), key=lambda t: t[0], reverse=False)
+        keys = [i[0] for i in l]
+        values = [i[1] for i in l]
 
         return (keys, values)
 
@@ -896,16 +1066,13 @@ class Keypatch_Form(idaapi.Form):
         # get original instruction and bytes
         self.orig_asm = kp_asm.ida_get_disasm(address)
         (self.orig_encoding, self.orig_len) = kp_asm.ida_get_item(address, hex_output=True)
-        if self.orig_encoding == None:
+        if self.orig_encoding is None:
             self.orig_encoding = ''
 
         if assembly is None:
             self.asm = self.kp_asm.ida_get_disasm(self.address, fixup=True)
         else:
             self.asm = assembly
-
-    def __init__(self, kp_asm, address, assembly=None, patch_mode=False, opts=0):
-        pass
 
     # update Encoding control
     # return True on success, False on failure
@@ -918,7 +1085,7 @@ class Keypatch_Form(idaapi.Form):
 
             address = self.GetControlValue(self.c_addr)
             try:
-                idaapi.isEnabled(address)
+                is_mapped(address)
             except:
                 # invalid address value
                 address = 0
@@ -947,8 +1114,8 @@ class Keypatch_Form(idaapi.Form):
                     self.SetControlValue(self.c_encoding, text.strip())
                     self.SetControlValue(self.c_encoding_len, len(encoding))
                     return True
-        except Exception,e:
-            print (str(e))
+        except Exception as e:
+            print(str(e))
             import traceback
             traceback.print_exc()
             self.SetControlValue(self.c_encoding, ENCODING_ERR_OUTPUT)
@@ -1024,7 +1191,7 @@ class Keypatch_FillRange(Keypatch_Form):
         self.addr_end = addr_end
 
         # create FillRange form
-        Form.__init__(self,
+        super(Keypatch_FillRange, self).__init__(
             r"""STARTITEM {id:c_assembly}
 BUTTON YES* Patch
 KEYPATCH:: Fill Range
@@ -1036,29 +1203,29 @@ KEYPATCH:: Fill Range
             <End        :{c_addr_end}>
             <Size       :{c_size}>
             <~A~ssembly   :{c_assembly}>
-             <-   Fixup :{c_raw_assembly}>
-             <-   Encode:{c_encoding}>
-             <-   Size  :{c_encoding_len}>
+             <##-   Fixup :{c_raw_assembly}>
+             <##-   Encode:{c_encoding}>
+             <##-   Size  :{c_encoding_len}>
             <~N~OPs padding until next instruction boundary:{c_opt_padding}>
             <Save ~o~riginal instructions in IDA comment:{c_opt_comment}>{c_opt_chk}>
             """, {
-            'c_endian': Form.DropdownListControl(
-                          items = self.kp_asm.endian_lists.keys(),
+            'c_endian': self.DropdownListControl(
+                          items = list(self.kp_asm.endian_lists.keys()),
                           readonly = True,
                           selval = self.endian_id),
-            'c_addr': Form.NumericInput(value=addr_begin, swidth=MAX_ADDRESS_LEN, tp=Form.FT_ADDR),
-            'c_addr_end': Form.NumericInput(value=addr_end - 1, swidth=MAX_ADDRESS_LEN, tp=Form.FT_ADDR),
-            'c_assembly': Form.StringInput(value=self.asm[:MAX_INSTRUCTION_STRLEN], width=MAX_INSTRUCTION_STRLEN),
-            'c_size': Form.NumericInput(value=addr_end - addr_begin, swidth=8, tp=Form.FT_DEC),
-            'c_raw_assembly': Form.StringInput(value='', width=MAX_INSTRUCTION_STRLEN),
-            'c_encoding': Form.StringInput(value='', width=MAX_ENCODING_LEN),
-            'c_encoding_len': Form.NumericInput(value=0, swidth=8, tp=Form.FT_DEC),
-            'c_syntax': Form.DropdownListControl(
+            'c_addr': self.NumericInput(value=addr_begin, swidth=MAX_ADDRESS_LEN, tp=self.FT_ADDR),
+            'c_addr_end': self.NumericInput(value=addr_end - 1, swidth=MAX_ADDRESS_LEN, tp=self.FT_ADDR),
+            'c_assembly': self.StringInput(value=self.asm[:MAX_INSTRUCTION_STRLEN], width=MAX_INSTRUCTION_STRLEN),
+            'c_size': self.NumericInput(value=addr_end - addr_begin, swidth=8, tp=self.FT_DEC),
+            'c_raw_assembly': self.StringInput(value='', width=MAX_INSTRUCTION_STRLEN),
+            'c_encoding': self.StringInput(value='', width=MAX_ENCODING_LEN),
+            'c_encoding_len': self.NumericInput(value=0, swidth=8, tp=self.FT_DEC),
+            'c_syntax': self.DropdownListControl(
                           items = self.syntax_keys,
                           readonly = True,
                           selval = self.syntax_id),
             'c_opt_chk':idaapi.Form.ChkGroupControl(('c_opt_padding', 'c_opt_comment', ''), value=opts['c_opt_chk']),
-            'FormChangeCb': Form.FormChangeCb(self.OnFormChange),
+            'FormChangeCb': self.FormChangeCb(self.OnFormChange),
             })
 
         self.Compile()
@@ -1078,7 +1245,7 @@ class Keypatch_Patcher(Keypatch_Form):
         self.setup(kp_asm, address, assembly)
 
         # create Patcher form
-        Form.__init__(self,
+        super(Keypatch_Patcher, self).__init__(
             r"""STARTITEM {id:c_assembly}
 BUTTON YES* Patch
 KEYPATCH:: Patcher
@@ -1088,33 +1255,33 @@ KEYPATCH:: Patcher
             <~S~yntax     :{c_syntax}>
             <Address    :{c_addr}>
             <Original   :{c_orig_assembly}>
-             <-   Encode:{c_orig_encoding}>
-             <-   Size  :{c_orig_len}>
+             <##-   Encode:{c_orig_encoding}>
+             <##-   Size  :{c_orig_len}>
             <~A~ssembly   :{c_assembly}>
-             <-   Fixup :{c_raw_assembly}>
-             <-   Encode:{c_encoding}>
-             <-   Size  :{c_encoding_len}>
+             <##-   Fixup :{c_raw_assembly}>
+             <##-   Encode:{c_encoding}>
+             <##-   Size  :{c_encoding_len}>
             <~N~OPs padding until next instruction boundary:{c_opt_padding}>
             <Save ~o~riginal instructions in IDA comment:{c_opt_comment}>{c_opt_chk}>
             """, {
-            'c_endian': Form.DropdownListControl(
-                          items = self.kp_asm.endian_lists.keys(),
+            'c_endian': self.DropdownListControl(
+                          items = list(self.kp_asm.endian_lists.keys()),
                           readonly = True,
                           selval = self.endian_id),
-            'c_addr': Form.NumericInput(value=address, swidth=MAX_ADDRESS_LEN, tp=Form.FT_ADDR),
-            'c_assembly': Form.StringInput(value=self.asm[:MAX_INSTRUCTION_STRLEN], width=MAX_INSTRUCTION_STRLEN),
-            'c_orig_assembly': Form.StringInput(value=self.orig_asm[:MAX_INSTRUCTION_STRLEN], width=MAX_INSTRUCTION_STRLEN),
-            'c_orig_encoding': Form.StringInput(value=self.orig_encoding[:MAX_ENCODING_LEN], width=MAX_ENCODING_LEN),
-            'c_orig_len': Form.NumericInput(value=self.orig_len, swidth=8, tp=Form.FT_DEC),
-            'c_raw_assembly': Form.StringInput(value='', width=MAX_INSTRUCTION_STRLEN),
-            'c_encoding': Form.StringInput(value='', width=MAX_ENCODING_LEN),
-            'c_encoding_len': Form.NumericInput(value=0, swidth=8, tp=Form.FT_DEC),
-            'c_syntax': Form.DropdownListControl(
+            'c_addr': self.NumericInput(value=address, swidth=MAX_ADDRESS_LEN, tp=self.FT_ADDR),
+            'c_assembly': self.StringInput(value=self.asm[:MAX_INSTRUCTION_STRLEN], width=MAX_INSTRUCTION_STRLEN),
+            'c_orig_assembly': self.StringInput(value=self.orig_asm[:MAX_INSTRUCTION_STRLEN], width=MAX_INSTRUCTION_STRLEN),
+            'c_orig_encoding': self.StringInput(value=self.orig_encoding[:MAX_ENCODING_LEN], width=MAX_ENCODING_LEN),
+            'c_orig_len': self.NumericInput(value=self.orig_len, swidth=8, tp=self.FT_DEC),
+            'c_raw_assembly': self.StringInput(value='', width=MAX_INSTRUCTION_STRLEN),
+            'c_encoding': self.StringInput(value='', width=MAX_ENCODING_LEN),
+            'c_encoding_len': self.NumericInput(value=0, swidth=8, tp=self.FT_DEC),
+            'c_syntax': self.DropdownListControl(
                           items = self.syntax_keys,
                           readonly = True,
                           selval = self.syntax_id),
-            'c_opt_chk':idaapi.Form.ChkGroupControl(('c_opt_padding', 'c_opt_comment', ''), value=opts['c_opt_chk']),
-            'FormChangeCb': Form.FormChangeCb(self.OnFormChange),
+            'c_opt_chk':self.ChkGroupControl(('c_opt_padding', 'c_opt_comment', ''), value=opts['c_opt_chk']),
+            'FormChangeCb': self.FormChangeCb(self.OnFormChange),
             })
 
         self.Compile()
@@ -1130,12 +1297,11 @@ KEYPATCH:: Patcher
 
 
 # Search position chooser
-class SearchResultChooser(idaapi.Choose2):
-    def __init__(self, title, items, flags=0, width=None, height=None, embedded=False, modal=False):        
-        Choose2.__init__(
-            self,
+class SearchResultChooser(Choose):
+    def __init__(self, title, items, flags=0, width=None, height=None, embedded=False, modal=False):
+        super(SearchResultChooser, self).__init__(
             title,
-            [["Address", idaapi.Choose2.CHCOL_HEX|40]],
+            [["Address", Choose.CHCOL_HEX|40]],
             flags = flags,
             width = width,
             height = height,
@@ -1150,11 +1316,11 @@ class SearchResultChooser(idaapi.Choose2):
 
     def OnSelectLine(self, n):
         self.selcount += 1
-        idc.Jump(self.items[n][0])
+        jumpto(self.items[n][0])
 
     def OnGetLine(self, n):
         res = self.items[n]
-        res = [atoa(res[0])]
+        res = [idc.atoa(res[0])]
         return res
 
     def OnGetSize(self):
@@ -1171,7 +1337,7 @@ class Keypatch_Search(Keypatch_Form):
         self.setup(kp_asm, address, assembly)
 
         # create Search form
-        Form.__init__(self,
+        super(Keypatch_Search, self).__init__(
             r"""STARTITEM {id:c_assembly}
 BUTTON YES* Search
 KEYPATCH:: Search
@@ -1182,32 +1348,39 @@ KEYPATCH:: Search
             <~S~yntax     :{c_syntax}>
             <A~d~dress    :{c_addr}>
             <~A~ssembly   :{c_assembly}>
-             <-   Fixup :{c_raw_assembly}>
-             <-   Encode:{c_encoding}>
-             <-   Size  :{c_encoding_len}>
+             <##-   Fixup :{c_raw_assembly}>
+             <##-   Encode:{c_encoding}>
+             <##-   Size  :{c_encoding_len}>
             """, {
-            'c_addr': Form.NumericInput(value=address, swidth=MAX_ADDRESS_LEN, tp=Form.FT_ADDR),
-            'c_assembly': Form.StringInput(value=self.asm[:MAX_INSTRUCTION_STRLEN], width=MAX_INSTRUCTION_STRLEN),
-            'c_raw_assembly': Form.StringInput(value='', width=MAX_INSTRUCTION_STRLEN),
-            'c_encoding': Form.StringInput(value='', width=MAX_ENCODING_LEN),
-            'c_encoding_len': Form.NumericInput(value=0, swidth=8, tp=Form.FT_DEC),
-            'c_arch': Form.DropdownListControl(
+            'c_addr': self.NumericInput(value=address, swidth=MAX_ADDRESS_LEN, tp=self.FT_ADDR),
+            'c_assembly': self.StringInput(value=self.asm[:MAX_INSTRUCTION_STRLEN], width=MAX_INSTRUCTION_STRLEN),
+            'c_raw_assembly': self.StringInput(value='', width=MAX_INSTRUCTION_STRLEN),
+            'c_encoding': self.StringInput(value='', width=MAX_ENCODING_LEN),
+            'c_encoding_len': self.NumericInput(value=0, swidth=8, tp=self.FT_DEC),
+            'c_arch': self.DropdownListControl(
                           items = self.arch_keys,
                           readonly = True,
                           selval = self.arch_id,
                           width = 32),
-            'c_endian': Form.DropdownListControl(
-                          items = self.kp_asm.endian_lists.keys(),
+            'c_endian': self.DropdownListControl(
+                          items = list(self.kp_asm.endian_lists.keys()),
                           readonly = True,
                           selval = self.endian_id),
-            'c_syntax': Form.DropdownListControl(
+            'c_syntax': self.DropdownListControl(
                           items = self.syntax_keys,
                           readonly = True,
                           selval = self.syntax_id),
-            'FormChangeCb': Form.FormChangeCb(self.OnFormChange),
+            'FormChangeCb': self.FormChangeCb(self.OnFormChange),
             })
 
         self.Compile()
+
+    ################################ IDA 6/7 Compatibility method #######################################
+    def find_binary(self, ea):
+        if idaapi.IDA_SDK_VERSION >= 700:
+            return ida_search.find_binary(ea, idaapi.cvar.inf.max_ea, self.GetControlValue(self.c_encoding), 16, idc.SEARCH_DOWN)
+        return idc.FindBinary(ea, idc.SEARCH_DOWN, self.GetControlValue(self.c_encoding))
+    #####################################################################################################
 
     # callback to be executed when any form control changed
     def OnFormChange(self, fid):
@@ -1216,13 +1389,13 @@ KEYPATCH:: Search
             address = 0
             addresses = []
             while address != idc.BADADDR:
-                address = idc.FindBinary(address, SEARCH_DOWN, self.GetControlValue(self.c_encoding))
+                address = self.find_binary(address)
                 if address == idc.BADADDR:
                     break
                 addresses.append([address])
                 address = address + 1
             c = SearchResultChooser("Searching for [{0}]".format(self.GetControlValue(self.c_raw_assembly)), addresses)
-            r = c.show()
+            c.show()
             return 1
 
         # only Search mode allows to select arch+mode
@@ -1275,19 +1448,19 @@ KEYPATCH:: Search
 class About_Form(idaapi.Form):
     def __init__(self, version):
         # create About form
-        Form.__init__(self,
+        super(About_Form, self).__init__(
             r"""STARTITEM 0
 BUTTON YES* Open Keypatch Website
 KEYPATCH:: About
 
             {FormChangeCb}
             Keypatch IDA plugin v%s, using Keystone Engine v%s.
-            (c) Nguyen Anh Quynh + Thanh Nguyen, 2016.
+            (c) Nguyen Anh Quynh + Thanh Nguyen, 2018.
 
             Keypatch is released under the GPL v2.
             Find more info at http://www.keystone-engine.org/keypatch
             """ %(version, keystone.__version__), {
-            'FormChangeCb': Form.FormChangeCb(self.OnFormChange),
+            'FormChangeCb': self.FormChangeCb(self.OnFormChange),
             })
 
         self.Compile()
@@ -1306,7 +1479,7 @@ KEYPATCH:: About
 class Update_Form(idaapi.Form):
     def __init__(self, version, message):
         # create Update form
-        Form.__init__(self,
+        super(Update_Form, self).__init__(
             r"""STARTITEM 0
 BUTTON YES* Open Keypatch Website
 KEYPATCH:: Check for update
@@ -1315,9 +1488,8 @@ KEYPATCH:: Check for update
             Your Keypatch is v%s
             %s
             """ %(version, message), {
-            'FormChangeCb': Form.FormChangeCb(self.OnFormChange),
+            'FormChangeCb': self.FormChangeCb(self.OnFormChange),
             })
-
         self.Compile()
 
     # callback to be executed when any form control changed
@@ -1333,8 +1505,6 @@ KEYPATCH:: Check for update
 try:
     # adapted from pull request #7 by @quangnh89
     class Kp_Menu_Context(idaapi.action_handler_t):
-        def __init__(self):
-            idaapi.action_handler_t.__init__(self)
 
         @classmethod
         def get_name(self):
@@ -1369,11 +1539,15 @@ try:
 
         @classmethod
         def update(self, ctx):
-            if ctx.form_type == idaapi.BWN_DISASM:
-                return idaapi.AST_ENABLE_FOR_FORM
-            else:
-                return idaapi.AST_DISABLE_FOR_FORM
-
+            try:
+                if ctx.form_type == idaapi.BWN_DISASM:
+                    return idaapi.AST_ENABLE_FOR_FORM
+                else:
+                    return idaapi.AST_DISABLE_FOR_FORM
+            except Exception as e:
+                # Add exception for main menu on >= IDA 7.0
+                return idaapi.AST_ENABLE_ALWAYS
+            
     # context menu for Patcher
     class Kp_MC_Patcher(Kp_Menu_Context):
         def activate(self, ctx):
@@ -1409,32 +1583,49 @@ try:
         def activate(self, ctx):
             self.plugin.about()
             return 1
+
 except:
     pass
 
-
 # hooks for popup menu
 class Hooks(idaapi.UI_Hooks):
-    def finish_populating_tform_popup(self, form, popup):
-        # We'll add our action to all "IDA View-*"s.
-        # If we wanted to add it only to "IDA View-A", we could
-        # also discriminate on the widget's title:
-        #
-        #  if idaapi.get_tform_title(form) == "IDA View-A":
-        #      ...
-        #
-        if idaapi.get_tform_type(form) == idaapi.BWN_DISASM:
-            try:
-                idaapi.attach_action_to_popup(form, popup, Kp_MC_Patcher.get_name(), 'Keypatch/')
-                idaapi.attach_action_to_popup(form, popup, Kp_MC_Fill_Range.get_name(), 'Keypatch/')
-                idaapi.attach_action_to_popup(form, popup, Kp_MC_Undo.get_name(), 'Keypatch/')
-                idaapi.attach_action_to_popup(form, popup, "-", 'Keypatch/')
-                idaapi.attach_action_to_popup(form, popup, Kp_MC_Search.get_name(), 'Keypatch/')
-                idaapi.attach_action_to_popup(form, popup, "-", 'Keypatch/')
-                idaapi.attach_action_to_popup(form, popup, Kp_MC_Updater.get_name(), 'Keypatch/')
-                idaapi.attach_action_to_popup(form, popup, Kp_MC_About.get_name(), 'Keypatch/')
-            except:
-                pass
+    if idaapi.IDA_SDK_VERSION >= 700:
+        # IDA >= 700 right click widget popup
+        def finish_populating_widget_popup(self, form, popup):
+            if idaapi.get_widget_type(form) == idaapi.BWN_DISASM:
+                try:
+                    idaapi.attach_action_to_popup(form, popup, Kp_MC_Patcher.get_name(), 'Keypatch/')
+                    idaapi.attach_action_to_popup(form, popup, Kp_MC_Fill_Range.get_name(), 'Keypatch/')
+                    idaapi.attach_action_to_popup(form, popup, Kp_MC_Undo.get_name(), 'Keypatch/')
+                    idaapi.attach_action_to_popup(form, popup, "-", 'Keypatch/')
+                    idaapi.attach_action_to_popup(form, popup, Kp_MC_Search.get_name(), 'Keypatch/')
+                    idaapi.attach_action_to_popup(form, popup, "-", 'Keypatch/')
+                    idaapi.attach_action_to_popup(form, popup, Kp_MC_Updater.get_name(), 'Keypatch/')
+                    idaapi.attach_action_to_popup(form, popup, Kp_MC_About.get_name(), 'Keypatch/')
+                except:
+                    pass
+    else:
+        # IDA < 700 right click popup
+        def finish_populating_tform_popup(self, form, popup):
+            # We'll add our action to all "IDA View-*"s.
+            # If we wanted to add it only to "IDA View-A", we could
+            # also discriminate on the widget's title:
+            #
+            #  if idaapi.get_tform_title(form) == "IDA View-A":
+            #      ...
+            #
+            if idaapi.get_tform_type(form) == idaapi.BWN_DISASM:
+                try:
+                    idaapi.attach_action_to_popup(form, popup, Kp_MC_Patcher.get_name(), 'Keypatch/')
+                    idaapi.attach_action_to_popup(form, popup, Kp_MC_Fill_Range.get_name(), 'Keypatch/')
+                    idaapi.attach_action_to_popup(form, popup, Kp_MC_Undo.get_name(), 'Keypatch/')
+                    idaapi.attach_action_to_popup(form, popup, "-", 'Keypatch/')
+                    idaapi.attach_action_to_popup(form, popup, Kp_MC_Search.get_name(), 'Keypatch/')
+                    idaapi.attach_action_to_popup(form, popup, "-", 'Keypatch/')
+                    idaapi.attach_action_to_popup(form, popup, Kp_MC_Updater.get_name(), 'Keypatch/')
+                    idaapi.attach_action_to_popup(form, popup, Kp_MC_About.get_name(), 'Keypatch/')
+                except:
+                    pass
 
 
 # check if we already initialized Keypatch
@@ -1449,7 +1640,6 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
     wanted_name = "Keypatch Patcher"
     wanted_hotkey = "Ctrl-Alt-K"
     flags = idaapi.PLUGIN_KEEP
-
 
     def load_configuration(self):
         # default
@@ -1495,30 +1685,40 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
         self.opts = None
         if kp_initialized == False:
             kp_initialized = True
-            # add Keypatch menu
-            menu = idaapi.add_menu_item("Edit/Keypatch/", "Patcher     (Ctrl-Alt-K)", "", 1, self.patcher, None)
-            if menu is not None:
-                idaapi.add_menu_item("Edit/Keypatch/", "About", "", 1, self.about, None)
-                idaapi.add_menu_item("Edit/Keypatch/", "Check for update", "", 1, self.updater, None)
-                idaapi.add_menu_item("Edit/Keypatch/", "-", "", 1, self.menu_null, None)
-                idaapi.add_menu_item("Edit/Keypatch/", "Search", "", 1, self.search, None)
-                idaapi.add_menu_item("Edit/Keypatch/", "-", "", 1, self.menu_null, None)
-                idaapi.add_menu_item("Edit/Keypatch/", "Undo last patching", "", 1, self.undo, None)
-                idaapi.add_menu_item("Edit/Keypatch/", "Fill Range", "", 1, self.fill_range, None)
-            elif idaapi.IDA_SDK_VERSION < 680:
-                # older IDAPython (such as in IDAPro 6.6) does add new submenu.
-                # in this case, put Keypatch menu in menu Edit \ Patch program
-                # not sure about v6.7, so to be safe we just check against v6.8
-                idaapi.add_menu_item("Edit/Patch program/", "-", "", 0, self.menu_null, None)
-                idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: About", "", 0, self.about, None)
-                idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Check for update", "", 0, self.updater, None)
-                idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Search", "", 0, self.search, None)
-                idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Undo last patching", "", 0, self.undo, None)
-                idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Fill Range", "", 0, self.fill_range, None)
-                idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Patcher     (Ctrl-Alt-K)", "", 0, self.patcher, None)
+
+            if idaapi.IDA_SDK_VERSION >= 700:
+                # Add menu IDA >= 7.0
+                idaapi.attach_action_to_menu("Edit/Keypatch/Patcher", Kp_MC_Patcher.get_name(), idaapi.SETMENU_APP)
+                idaapi.attach_action_to_menu("Edit/Keypatch/About", Kp_MC_About.get_name(), idaapi.SETMENU_APP)
+                idaapi.attach_action_to_menu("Edit/Keypatch/Check for update", Kp_MC_Updater.get_name(), idaapi.SETMENU_APP)
+                idaapi.attach_action_to_menu("Edit/Keypatch/Search", Kp_MC_Search.get_name(), idaapi.SETMENU_APP)
+                idaapi.attach_action_to_menu("Edit/Keypatch/Undo last patching", Kp_MC_Undo.get_name(), idaapi.SETMENU_APP)
+                idaapi.attach_action_to_menu("Edit/Keypatch/Fill Range", Kp_MC_Fill_Range.get_name(), idaapi.SETMENU_APP)
+            else:
+                # add Keypatch menu
+                menu = idaapi.add_menu_item("Edit/Keypatch/", "Patcher     (Ctrl-Alt-K)", "", 1, self.patcher, None)
+                if menu is not None:
+                    idaapi.add_menu_item("Edit/Keypatch/", "About", "", 1, self.about, None)
+                    idaapi.add_menu_item("Edit/Keypatch/", "Check for update", "", 1, self.updater, None)
+                    idaapi.add_menu_item("Edit/Keypatch/", "-", "", 1, self.menu_null, None)
+                    idaapi.add_menu_item("Edit/Keypatch/", "Search", "", 1, self.search, None)
+                    idaapi.add_menu_item("Edit/Keypatch/", "-", "", 1, self.menu_null, None)
+                    idaapi.add_menu_item("Edit/Keypatch/", "Undo last patching", "", 1, self.undo, None)
+                    idaapi.add_menu_item("Edit/Keypatch/", "Fill Range", "", 1, self.fill_range, None)
+                elif idaapi.IDA_SDK_VERSION < 680:
+                    # older IDAPython (such as in IDAPro 6.6) does add new submenu.
+                    # in this case, put Keypatch menu in menu Edit \ Patch program
+                    # not sure about v6.7, so to be safe we just check against v6.8
+                    idaapi.add_menu_item("Edit/Patch program/", "-", "", 0, self.menu_null, None)
+                    idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: About", "", 0, self.about, None)
+                    idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Check for update", "", 0, self.updater, None)
+                    idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Search", "", 0, self.search, None)
+                    idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Undo last patching", "", 0, self.undo, None)
+                    idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Fill Range", "", 0, self.fill_range, None)
+                    idaapi.add_menu_item("Edit/Patch program/", "Keypatch:: Patcher     (Ctrl-Alt-K)", "", 0, self.patcher, None)
 
             print("=" * 80)
-            print("Keypatch v{0} (c) Nguyen Anh Quynh & Thanh Nguyen, 2016".format(VERSION))
+            print("Keypatch v{0} (c) Nguyen Anh Quynh & Thanh Nguyen, 2018".format(VERSION))
             print("Keypatch is using Keystone v{0}".format(keystone.__version__))
             print("Keypatch Patcher's shortcut key is Ctrl-Alt-K")
             print("Use the same hotkey Ctrl-Alt-K to open 'Fill Range' window on a selected range of code")
@@ -1561,6 +1761,7 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
     # handler for Check-for-Update menu
     def updater(self):
         (r, content) = url_download(KP_GITHUB_VERSION)
+        content = to_string(content)
         if r == 0:
             # find stable version
             sig = 'VERSION_STABLE = "'
@@ -1580,7 +1781,7 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
                 f.Free()
         else:
             # fail to download
-            idc.Warning("ERROR: Keypatch failed to connect to internet (Github). Try again later.")
+            warning("ERROR: Keypatch failed to connect to internet (Github). Try again later.")
             print("Keypatch: FAILED to connect to Github to check for latest update. Try again later.")
 
     # handler for Undo menu
@@ -1588,7 +1789,7 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
         global patch_info
         if len(patch_info) == 0:
             # TODO: disable Undo menu?
-            idc.Warning("ERROR: Keypatch already got to the last undo patching!")
+            warning("ERROR: Keypatch already got to the last undo patching!")
         else:
             (address, assembly, p_orig_data, patch_comment) = patch_info[-1]
 
@@ -1598,7 +1799,7 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
 
     # handler for Search menu
     def search(self):
-        address = idc.ScreenEA()
+        address = get_screen_ea()
         f = Keypatch_Search(self.kp_asm, address)
         f.Execute()
         f.Free()
@@ -1607,15 +1808,15 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
     def patcher(self):
         # be sure that this arch is supported by Keystone
         if self.kp_asm.arch is None:
-            idc.Warning("ERROR: Keypatch cannot handle this architecture (unsupported by Keystone), quit!")
+            warning("ERROR: Keypatch cannot handle this architecture (unsupported by Keystone), quit!")
             return
 
-        selection, addr_begin, addr_end = idaapi.read_selection()
+        selection, addr_begin, addr_end = read_range_selection()
         if selection:
             # call Fill Range function on this selected code
             return self.fill_range()
 
-        address = idc.ScreenEA()
+        address = get_screen_ea()
 
         if self.opts is None:
             self.load_configuration()
@@ -1649,11 +1850,11 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
                     else:
                         init_assembly = f.c_assembly.value
                         if length == 0:
-                            idc.Warning("ERROR: Keypatch found invalid assembly [{0}]".format(assembly))
+                            warning("ERROR: Keypatch found invalid assembly [{0}]".format(assembly))
                         elif length == -1:
-                            idc.Warning("ERROR: Keypatch failed to patch binary at 0x{0:X}!".format(address))
+                            warning("ERROR: Keypatch failed to patch binary at 0x{0:X}!".format(address))
                         elif length == -2:
-                            idc.Warning("ERROR: Keypatch can't read original data at 0x{0:X}, try again".format(address))
+                            warning("ERROR: Keypatch can't read original data at 0x{0:X}, try again".format(address))
 
                 except KsError as e:
                     print("Keypatch Error: {0}".format(e))
@@ -1665,12 +1866,12 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
     def fill_range(self):
         # be sure that this arch is supported by Keystone
         if self.kp_asm.arch is None:
-            idc.Warning("ERROR: Keypatch cannot handle this architecture (unsupported by Keystone), quit!")
+            warning("ERROR: Keypatch cannot handle this architecture (unsupported by Keystone), quit!")
             return
-
-        selection, addr_begin, addr_end = idaapi.read_selection()
+               
+        selection, addr_begin, addr_end = read_range_selection()
         if not selection:
-            idc.Warning("ERROR: Keypatch requires a range to be selected for fill in, try again")
+            warning("ERROR: Keypatch requires a range to be selected for fill in, try again")
             return
 
         if self.opts is None:
@@ -1698,10 +1899,10 @@ class Keypatch_Plugin_t(idaapi.plugin_t):
 
                 length = self.kp_asm.fill_code(addr_begin, addr_end, raw_assembly, syntax, padding, comment, None)
                 if length == 0:
-                    idc.Warning("ERROR: Keypatch failed to process this input.")
+                    warning("ERROR: Keypatch failed to process this input.")
                     print("Keypatch: FAILED to process this input '{0}'".format(assembly))
                 elif length == -1:
-                    idc.Warning("ERROR: Keypatch failed to patch binary at 0x{0:X}!".format(addr_begin))
+                    warning("ERROR: Keypatch failed to patch binary at 0x{0:X}!".format(addr_begin))
 
             except KsError as e:
                 print("Keypatch Error: {0}".format(e))
